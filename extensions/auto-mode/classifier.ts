@@ -90,6 +90,30 @@ function resolveConfiguredModel(
   return parsed ? ctx.modelRegistry.find(parsed.provider, parsed.id) : undefined;
 }
 
+/**
+ * The classifier models to try, in order: each configured model, then the models the
+ * host's `retry.fallbackChains` moves to when that one fails, so the classifier follows
+ * the session onto another provider when one runs out. OMP builds with
+ * `ctx.models.fallbacks` (starkedev's omp patch) report the chain; Pi and stock OMP don't,
+ * so only the configured models run there. Chains are read lazily, only once a model fails.
+ */
+function* classifierCandidates(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+): Generator<string | undefined> {
+  const models: unknown = "models" in ctx ? ctx.models : undefined;
+  const fallbacks = models && typeof models === "object" && "fallbacks" in models &&
+      typeof models.fallbacks === "function"
+    ? (spec: string): Model<any>[] => (models.fallbacks as (spec: string) => Model<any>[])(spec)
+    : undefined;
+  for (const configured of [config.classifierModel, ...config.classifierFallbackModels]) {
+    yield configured;
+    const spec = configured ?? (ctx.model ? formatModelSpec(ctx.model) : undefined);
+    if (!fallbacks || !spec) continue;
+    for (const model of fallbacks(spec)) yield formatModelSpec(model);
+  }
+}
+
 async function resolveClassifier(
   ctx: ExtensionContext,
   config: EffectiveConfig,
@@ -940,7 +964,8 @@ export const defaultClassifyAction: ClassifyAction = async (
     detailedInstruction: CLASSIFIER_DETAILED_INSTRUCTION,
   };
   const actionMessage = buildClassifierActionMessage(action);
-  for (const configured of [config.classifierModel, ...config.classifierFallbackModels]) {
+  const tried = new Set<string>();
+  for (const configured of classifierCandidates(ctx, config)) {
     if (ctx.signal?.aborted) {
       result = { ...CANCELLED, reasoning: result.reasoning };
       break;
@@ -965,6 +990,8 @@ export const defaultClassifyAction: ClassifyAction = async (
     const classifier = resolution.classifier;
     const completionPlan = resolution.completionPlan;
     const model = formatModelSpec(classifier.model);
+    if (tried.has(model)) continue;
+    tried.add(model);
     const { failure, ...decision } = await classifyInStages(
       completionPlan.completeFn,
       classifier,

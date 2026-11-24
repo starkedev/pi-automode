@@ -39,14 +39,23 @@ function setup(options: {
   timeout?: number;
   classifierModel?: string;
   roles?: Record<string, string>;
+  chains?: Record<string, string[]>;
 } = {}) {
   const calls: Array<{ id: string; stage: string; options: any }> = [];
   const lookups: string[] = [];
+  const chainQueries: string[] = [];
   const model = (id: string) => ({ provider: "test", id, api: "test", reasoning: false, contextWindow: 128_000, maxTokens: 32_000 });
   const ctx = createFakeCtx([], {
     model: model("primary"), signal: options.signal,
-    ...(options.roles
-      ? { models: { resolve: (spec: string) => options.roles![spec] ? model(options.roles![spec]) : undefined } }
+    ...(options.roles || options.chains
+      ? {
+        models: {
+          resolve: (spec: string) => options.roles?.[spec] ? model(options.roles[spec]) : undefined,
+          ...(options.chains
+            ? { fallbacks: (spec: string) => { chainQueries.push(spec); return (options.chains![spec] ?? []).map(model); } }
+            : {}),
+        },
+      }
       : {}),
     modelRegistry: {
       find(_provider: string, id: string) {
@@ -66,8 +75,44 @@ function setup(options: {
   });
   const config = baseConfig({ classifierModel: options.classifierModel ?? "test/primary", classifierFallbackModels: options.fallbacks ?? ["test/backup", "test/last"], classifierTimeoutMs: options.timeout ?? 1000 });
   const run = () => defaultClassifyAction(ctx as never, config, '{"toolName":"noop","input":{}}', "");
-  return { ctx, config, run, calls, lookups };
+  return { ctx, config, run, calls, lookups, chainQueries };
 }
+
+test("each configured model is followed by the host's fallback chain for it", async () => {
+  const down = new Set(["sonnet", "haiku"]);
+  const h = setup({
+    classifierModel: "@smol", fallbacks: ["@tiny"],
+    roles: { "@smol": "sonnet", "@tiny": "haiku" },
+    chains: { "@smol": ["sol"], "@tiny": ["luna"] },
+    complete: async (id) => { if (down.has(id)) throw new Error(`${id} rate limited`); return response("0"); },
+  });
+  let result = await h.run();
+  assert.equal(result.decision, "allow");
+  assert.equal(result.classifier?.model, "test/sol");
+  assert.deepEqual(result.classifier?.failures.map((f) => f.model), ["test/sonnet"]);
+  assert.deepEqual(h.chainQueries, ["@smol"]);
+
+  down.add("sol");
+  result = await h.run();
+  assert.equal(result.classifier?.model, "test/luna");
+  assert.deepEqual(result.classifier?.failures.map((f) => f.model), ["test/sonnet", "test/sol", "test/haiku"]);
+});
+
+test("the host chain is not read when the first model answers", async () => {
+  const h = setup({ chains: { "test/primary": ["sol"] } });
+  assert.equal((await h.run()).classifier?.model, "test/primary");
+  assert.deepEqual(h.chainQueries, []);
+});
+
+test("a model reached through both a chain and the configured list runs once", async () => {
+  const h = setup({
+    chains: { "test/primary": ["backup"] },
+    complete: async (id) => { if (id !== "last") throw new Error(`${id} offline`); return response("0"); },
+  });
+  const result = await h.run();
+  assert.equal(result.classifier?.model, "test/last");
+  assert.deepEqual(h.calls.map((c) => c.id), ["primary", "backup", "last"]);
+});
 
 test("fallback configuration defaults, replaces by precedence, and ignores shared project settings", () => {
   assert.deepEqual(buildEffectiveConfigFromSources().classifierFallbackModels, []);
